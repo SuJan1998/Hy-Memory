@@ -38,6 +38,28 @@ import {
 } from "./source-notifications.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
+/**
+ * Where the broker listens. Loopback by default; a host that keeps its memory
+ * on another machine sets this to `0.0.0.0` or to one interface address.
+ */
+const BIND_HOST = process.env.ONE_MEMORY_BROKER_BIND?.trim() || LOOPBACK_HOST;
+/**
+ * The address a client should dial, written into the discovery file. Separate
+ * from `BIND_HOST` because a broker bound to `0.0.0.0` still has to publish the
+ * one address a remote host can reach.
+ */
+const PUBLIC_HOST = process.env.ONE_MEMORY_BROKER_PUBLIC_HOST?.trim() || LOOPBACK_HOST;
+/**
+ * Address prefixes allowed to connect besides loopback, comma separated. Empty
+ * means loopback only, which is the default. Prefix matching is deliberate: the
+ * point is to admit one LAN, and a CIDR parser here would be a dependency and a
+ * parsing surface for no extra safety. The grant store still authenticates every
+ * request, so this is a second lock, not the lock.
+ */
+const ALLOWED_CLIENT_PREFIXES = (process.env.ONE_MEMORY_BROKER_ALLOW ?? "")
+  .split(",")
+  .map((entry) => entry.trim())
+  .filter(Boolean);
 const DEFAULT_PORT = 18_765;
 const MAX_BODY_BYTES = 64 * 1024;
 /** 12,000 characters, each of which JSON may escape to six bytes. */
@@ -218,7 +240,7 @@ export class RecallBroker {
       schema_version: 1,
       service: "one-memory-recall-broker",
       status,
-      host: LOOPBACK_HOST,
+      host: PUBLIC_HOST,
       port,
       instance_id: this.options.instanceId,
       pid: process.pid,
@@ -231,8 +253,8 @@ export class RecallBroker {
     response: ServerResponse,
   ): Promise<void> {
     setSecurityHeaders(response);
-    if (!isLoopback(request.socket.remoteAddress)) {
-      sendJson(response, 403, { error: "loopback clients only" });
+    if (!isAllowedClient(request.socket.remoteAddress)) {
+      sendJson(response, 403, { error: "client not allowed" });
       return;
     }
     if (request.method === "GET" && request.url === "/health") {
@@ -1403,6 +1425,22 @@ function isLoopback(address: string | undefined): boolean {
   );
 }
 
+/**
+ * Loopback, or one of the configured LAN prefixes.
+ *
+ * A dual-stack listener reports IPv4 peers as `::ffff:a.b.c.d`, so the prefix
+ * match also has to try the address without that wrapper or a LAN client would
+ * be turned away by the shape of its own address.
+ */
+function isAllowedClient(address: string | undefined): boolean {
+  if (isLoopback(address)) return true;
+  if (!address || ALLOWED_CLIENT_PREFIXES.length === 0) return false;
+  const bare = address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
+  return ALLOWED_CLIENT_PREFIXES.some(
+    (prefix) => address.startsWith(prefix) || bare.startsWith(prefix),
+  );
+}
+
 function isAddressInUse(error: unknown): boolean {
   return (
     error instanceof Error &&
@@ -1426,7 +1464,7 @@ function listen(
     };
     server.once("error", onError);
     server.once("listening", onListening);
-    server.listen(port, LOOPBACK_HOST);
+    server.listen(port, BIND_HOST);
   });
 }
 

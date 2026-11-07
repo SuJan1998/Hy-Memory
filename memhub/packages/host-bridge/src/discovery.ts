@@ -6,7 +6,12 @@ export interface BrokerDiscovery {
   schema_version: 1;
   service: "one-memory-recall-broker";
   status: "running" | "stopped";
-  host: "127.0.0.1";
+  /**
+   * The address a client should dial. Loopback for a local broker; the host's
+   * LAN address when the memory lives on another machine
+   * (`ONE_MEMORY_BROKER_PUBLIC_HOST`).
+   */
+  host: string;
   port: number | null;
   instance_id: string;
   pid: number;
@@ -55,6 +60,23 @@ export async function readDiscovery(
   return value;
 }
 
+/**
+ * A discovery host is interpolated into `http://${host}:${port}`, so it must be
+ * a bare address or hostname: no scheme, no path, no port, no whitespace.
+ *
+ * This was an equality test against `127.0.0.1` while the broker could only
+ * listen on loopback. A host that keeps its memory on another machine needs the
+ * real address here, so the check becomes a shape check — still strict enough
+ * that a tampered discovery file cannot point the client at another origin,
+ * because a path or a port separator is rejected.
+ *
+ * IPv6 literals are not accepted: the URL builder has no brackets, so `::1`
+ * would produce `http://::1:18765` and fail regardless.
+ */
+function isDiscoveryHost(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$/.test(value);
+}
+
 function isBrokerDiscovery(value: unknown): value is BrokerDiscovery {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<BrokerDiscovery>;
@@ -62,7 +84,7 @@ function isBrokerDiscovery(value: unknown): value is BrokerDiscovery {
     candidate.schema_version === 1 &&
     candidate.service === "one-memory-recall-broker" &&
     (candidate.status === "running" || candidate.status === "stopped") &&
-    candidate.host === "127.0.0.1" &&
+    isDiscoveryHost(candidate.host) &&
     (candidate.port === null ||
       (Number.isInteger(candidate.port) &&
         (candidate.port ?? 0) > 0 &&
