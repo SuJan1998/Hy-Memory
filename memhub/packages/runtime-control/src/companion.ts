@@ -13,7 +13,7 @@
  * can be checked before anything is allowed to change it.
  */
 
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -21,6 +21,7 @@ import path from "node:path";
 import { DISCOVERY_KEY, mcpConfigPath } from "@one-memory/host-bridge/installer";
 
 import { isHostPresent, recallHosts, type RecallHostDescriptor } from "./recall-hosts.js";
+import { summarize, type SyncConfig, syncOnce } from "./sync.js";
 
 export interface CompanionHostReport {
   hostId: string;
@@ -180,6 +181,16 @@ export interface CompanionConfig {
    * works, and curl with no `Origin` header still works.
    */
   allowedOrigins: string[];
+  /** Where the Core that keeps this machine's memory lives. */
+  server?: {
+    url: string;
+    /**
+     * The `omhg_v1_…` credential file. Optional: pairing already leaves one in
+     * a fixed place, and a machine that has paired once has exactly one.
+     */
+    credentialFile?: string;
+  };
+  sync?: SyncConfig;
 }
 
 const DEFAULT_CONFIG: CompanionConfig = {
@@ -189,6 +200,41 @@ const DEFAULT_CONFIG: CompanionConfig = {
 
 export function configPath(home: string = homedir()): string {
   return path.join(home, ".one-memory", "companion.json");
+}
+
+function readSync(value: unknown, target: string): SyncConfig | undefined {
+  if (value === undefined) return undefined;
+  const candidate = value as Partial<SyncConfig>;
+  if (typeof candidate.enabled !== "boolean") {
+    throw new Error(`companion 配置的 sync.enabled 无效: ${target}`);
+  }
+  const settleSeconds = candidate.settleSeconds ?? 2;
+  if (typeof settleSeconds !== "number" || !Number.isFinite(settleSeconds) || settleSeconds < 0) {
+    throw new Error(`companion 配置的 sync.settleSeconds 无效: ${target}`);
+  }
+  const intervalSeconds = candidate.intervalSeconds ?? 60;
+  if (
+    typeof intervalSeconds !== "number" ||
+    !Number.isFinite(intervalSeconds) ||
+    intervalSeconds < 5
+  ) {
+    throw new Error(`companion 配置的 sync.intervalSeconds 无效: ${target}`);
+  }
+  const sources = candidate.sources ?? [];
+  if (!Array.isArray(sources)) {
+    throw new Error(`companion 配置的 sync.sources 无效: ${target}`);
+  }
+  for (const source of sources) {
+    if (
+      typeof source?.sourceId !== "string" ||
+      source.sourceId === "" ||
+      typeof source.root !== "string" ||
+      source.root === ""
+    ) {
+      throw new Error(`companion 配置的 sync.sources 项无效: ${target}`);
+    }
+  }
+  return { enabled: candidate.enabled, settleSeconds, intervalSeconds, sources };
 }
 
 /** The config file is optional: absent means the defaults, which bind loopback. */
@@ -216,7 +262,60 @@ export async function loadConfig(target: string = configPath()): Promise<Compani
   if (!Array.isArray(allowedOrigins) || !allowedOrigins.every((item) => typeof item === "string")) {
     throw new Error(`companion 配置的 allowedOrigins 无效: ${target}`);
   }
-  return { listen: { host: listen.host, port: listen.port }, allowedOrigins };
+  if (value.server !== undefined && typeof value.server?.url !== "string") {
+    throw new Error(`companion 配置的 server.url 无效: ${target}`);
+  }
+  if (
+    value.server?.credentialFile !== undefined &&
+    typeof value.server.credentialFile !== "string"
+  ) {
+    throw new Error(`companion 配置的 server.credentialFile 无效: ${target}`);
+  }
+  const sync = readSync(value.sync, target);
+  return {
+    listen: { host: listen.host, port: listen.port },
+    allowedOrigins,
+    ...(value.server === undefined
+      ? {}
+      : {
+          server: {
+            url: value.server.url,
+            ...(value.server.credentialFile === undefined
+              ? {}
+              : { credentialFile: value.server.credentialFile }),
+          },
+        }),
+    ...(sync === undefined ? {} : { sync }),
+  };
+}
+
+/**
+ * The host credential this machine paired with.
+ *
+ * Order matters: an explicit path wins, then the variable a host application
+ * would have set, then the one installation pairing leaves behind. The install
+ * directory is named by a hash of the source root, so it cannot be derived here
+ * -- which is why more than one is an error rather than a guess.
+ */
+async function resolveCredential(configured: string | undefined): Promise<string> {
+  const candidates = [configured, process.env.ONE_MEMORY_HOST_CREDENTIAL_FILE];
+  for (const candidate of candidates) {
+    if (candidate !== undefined && candidate !== "") {
+      return (await readFile(candidate, "utf8")).trim();
+    }
+  }
+  const installations = path.join(homedir(), ".one-memory", "host-permissions", "installations");
+  const entries = await readdir(installations, { withFileTypes: true }).catch(() => []);
+  const directories = entries.filter((entry) => entry.isDirectory());
+  if (directories.length === 1) {
+    const file = path.join(installations, directories[0]!.name, "credential");
+    return (await readFile(file, "utf8")).trim();
+  }
+  throw new Error(
+    directories.length === 0
+      ? "找不到 host 凭据：这台机器还没配对过"
+      : `找到 ${directories.length} 份 host 凭据，请在 companion.json 里用 server.credentialFile 指定`,
+  );
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
@@ -333,8 +432,11 @@ const USAGE = `用法: node companion.cjs <command>
   list      列出本机装了哪些可接入的应用，以及是否已接入
   status    同 list，但输出 JSON
   serve     在 127.0.0.1 上提供 HTTP，供本机浏览器里的 Web Console 查询
+  sync once   把本机源目录里新增的字节推给服务器，跑一轮就退出
+  sync watch  同上，但按 sync.intervalSeconds 一直跑
 
-只读，不会修改任何文件。serve 的允许来源读 ~/.one-memory/companion.json。
+只读 list/status，不会修改任何文件。serve 的允许来源、sync 的目标与源目录
+都读 ~/.one-memory/companion.json。
 `;
 
 export async function main(
@@ -353,6 +455,46 @@ export async function main(
     const config = await loadConfig();
     await serve(config, { stdout: io.stdout });
     return 0;
+  }
+  if (command === "sync") {
+    const [mode] = argv.slice(1);
+    if (mode !== undefined && mode !== "once" && mode !== "watch") {
+      io.stderr(`未知的 sync 子命令: ${mode}\n\n${USAGE}`);
+      return 2;
+    }
+    const config = await loadConfig();
+    if (config.sync === undefined || !config.sync.enabled) {
+      io.stderr("同步未启用：在 companion.json 里设 sync.enabled = true\n");
+      return 2;
+    }
+    if (config.server === undefined) {
+      io.stderr("缺少 server.url：companion 不知道把文件推给谁\n");
+      return 2;
+    }
+    if (config.sync.sources.length === 0) {
+      // The server knows where a source root sits on *its* disk, which says
+      // nothing about this machine. Only the host can name its own paths.
+      io.stderr("sync.sources 为空：这台机器的源目录必须在这里写清楚\n");
+      return 2;
+    }
+    const server = config.server;
+    const sync = config.sync;
+    const credential = await resolveCredential(server.credentialFile);
+    const run = async () => {
+      const outcomes = await syncOnce({
+        serverUrl: server.url,
+        credential,
+        sources: sync.sources,
+        settleSeconds: sync.settleSeconds,
+      });
+      io.stdout(`${new Date().toISOString()}  ${summarize(outcomes)}\n`);
+    };
+    await run();
+    if (mode !== "watch") return 0;
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, sync.intervalSeconds * 1000));
+      await run();
+    }
   }
   if (command !== "list" && command !== "status") {
     io.stderr(`未知命令: ${command}\n\n${USAGE}`);
