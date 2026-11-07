@@ -11,7 +11,10 @@ const releaseVersion = resolveBuildVersion(process.env);
 const releaseBuildNumber = resolveBuildNumber(process.env);
 
 export default defineConfig({
-  entry: { runtime: "src/runtime-entry.ts" },
+  entry: {
+    runtime: "src/runtime-entry.ts",
+    companion: "src/companion-entry.ts",
+  },
   format: ["cjs"],
   platform: "node",
   outDir: "dist",
