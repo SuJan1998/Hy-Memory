@@ -103,6 +103,23 @@ describe("inspectRecallBrokerStatus", () => {
     expect(axios.get).not.toHaveBeenCalled();
   });
 
+  it("accepts the LAN address the broker advertises, and still probes loopback", async () => {
+    // On a LAN deploy the broker writes the address a *remote* host should dial,
+    // so the file is not loopback. Reading it as invalid is what made `memhub
+    // status` report a healthy broker as untrusted; the local probe must keep
+    // dialing loopback regardless of what the file says.
+    await put({ ...receipt, host: "192.168.0.108" });
+
+    expect(await inspect()).toEqual({
+      state: "running",
+      code: "broker_verified",
+      instanceId: receipt.instance_id,
+      host: "127.0.0.1",
+      port: 18765,
+    });
+    expect(probe).toHaveBeenCalledWith({ ...receipt, host: "127.0.0.1" });
+  });
+
   it("does not create an absent home or search a different discovery path", async () => {
     expect(await inspect()).toEqual({
       state: "stopped",
@@ -172,10 +189,13 @@ describe("inspectRecallBrokerStatus", () => {
   it.each([
     { schema_version: 2 },
     { service: "one-memory-core" },
-    { host: "localhost" },
+    // A host is rejected when it could carry a path or a port, not when it is
+    // merely not loopback: on a LAN deploy the broker advertises its LAN
+    // address, and this module used to call that file invalid.
     { host: "::1" },
-    { host: "127.0.0.2" },
     { host: "https://example.invalid" },
+    { host: "192.168.0.108:18765" },
+    { host: "/tmp/socket" },
     { port: null },
     { port: 0 },
     { port: -1 },

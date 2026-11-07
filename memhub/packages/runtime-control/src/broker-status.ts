@@ -1,7 +1,7 @@
 import { constants, type Stats } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import path from "node:path";
-import type { BrokerDiscovery } from "@one-memory/host-bridge";
+import { type BrokerDiscovery, isBrokerDiscovery } from "@one-memory/host-bridge";
 import axios from "axios";
 
 const MAX_BYTES = 16 * 1024;
@@ -194,25 +194,24 @@ function sameFile(left: Stats, right: Stats): boolean {
 }
 
 function parseDiscovery(value: unknown): Readonly<BrokerDiscovery> {
+  // `isBrokerDiscovery` is the shared shape check, and it accepts a host that is
+  // not loopback because the broker advertises the address a *remote* host
+  // should dial. This module used to keep its own copy that required exactly
+  // `127.0.0.1`, so on a LAN deploy -- where the broker writes the LAN address --
+  // every read threw `broker_discovery_invalid` and `memhub status` reported a
+  // healthy broker as `untrusted`. Probing is unaffected: every probe here dials
+  // loopback itself, so a tampered file still cannot steer one off the machine.
   if (
-    !isRecord(value) ||
-    value.schema_version !== 1 ||
-    value.service !== SERVICE ||
-    (value.status !== "running" && value.status !== "stopped") ||
-    value.host !== "127.0.0.1" ||
+    !isBrokerDiscovery(value) ||
     !validInstanceId(value.instance_id) ||
-    typeof value.pid !== "number" ||
     !Number.isSafeInteger(value.pid) ||
     value.pid <= 1 ||
     value.pid > 2_147_483_647 ||
-    typeof value.updated_at !== "string" ||
     !Number.isFinite(Date.parse(value.updated_at)) ||
-    (value.status === "stopped"
-      ? value.port !== null
-      : typeof value.port !== "number" ||
-        !Number.isInteger(value.port) ||
-        value.port < 1 ||
-        value.port > 65_535)
+    // A running broker has a port and a stopped one does not. `isBrokerDiscovery`
+    // allows either shape for either status because the client only dials a
+    // running one; this reader has to tell them apart to report which it saw.
+    (value.status === "stopped" ? value.port !== null : value.port === null)
   ) {
     throw new DiscoveryError("broker_discovery_invalid");
   }
