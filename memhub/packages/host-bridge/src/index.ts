@@ -17,6 +17,7 @@ export {
 export { isConnectionControlError } from "./control-errors.js";
 export {
   type BrokerDiscovery,
+  isBrokerDiscovery,
   readDiscovery,
   writeDiscovery,
 } from "./discovery.js";

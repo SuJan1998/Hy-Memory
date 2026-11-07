@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import type { BrokerDiscovery } from "@one-memory/host-bridge";
+import { type BrokerDiscovery, isBrokerDiscovery } from "@one-memory/host-bridge";
 import axios from "axios";
 
 import { processIsAlive } from "./core-supervisor.js";
@@ -152,24 +152,6 @@ async function readBrokerDiscovery(target: string): Promise<BrokerDiscovery> {
     throw new Error("runtime_broker_discovery_invalid");
   }
   return value;
-}
-
-function isBrokerDiscovery(value: unknown): value is BrokerDiscovery {
-  if (!value || typeof value !== "object") return false;
-  const item = value as Partial<BrokerDiscovery>;
-  return (
-    item.schema_version === 1 &&
-    item.service === "one-memory-recall-broker" &&
-    (item.status === "running" || item.status === "stopped") &&
-    item.host === "127.0.0.1" &&
-    (item.port === null ||
-      (Number.isInteger(item.port) &&
-        (item.port ?? 0) > 0 &&
-        (item.port ?? 0) <= 65_535)) &&
-    typeof item.instance_id === "string" &&
-    typeof item.pid === "number" &&
-    typeof item.updated_at === "string"
-  );
 }
 
 async function defaultProbeBroker(discovery: BrokerDiscovery): Promise<void> {

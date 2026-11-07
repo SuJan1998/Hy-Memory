@@ -77,7 +77,17 @@ function isDiscoveryHost(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$/.test(value);
 }
 
-function isBrokerDiscovery(value: unknown): value is BrokerDiscovery {
+/**
+ * Whether `value` is a well-formed broker discovery receipt.
+ *
+ * Exported because the runtime keeps its own copy of the read path
+ * (`runtime-control/src/recall-broker-supervisor.ts`) and the two drifted: when
+ * only the client-side check learned about a non-loopback host, the runtime's
+ * copy kept rejecting the file the broker had just written, so a restart after a
+ * LAN deploy failed with `runtime_broker_discovery_invalid` and the broker never
+ * started. One definition, both readers.
+ */
+export function isBrokerDiscovery(value: unknown): value is BrokerDiscovery {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<BrokerDiscovery>;
   return (
