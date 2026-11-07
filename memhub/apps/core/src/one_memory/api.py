@@ -1724,12 +1724,9 @@ def create_app(
             app.state.file_import_store = FileImportStore(
                 runtime_settings.data_dir / "import-files"
             )
-            # Files a host pushes to us over the network land here and are read
-            # back as an ordinary source root, so nothing downstream needs to
-            # know they did not start on this disk.
-            app.state.received_file_store = ReceivedFileStore(
-                runtime_settings.data_dir / "received"
-            )
+            # Sync appends straight into a source's granted root, so there is no
+            # receiving tree to keep in step with the importer. This only holds
+            # the per-source lock that serialises appends.
             app.state.sync_source_locks = {}
             app.state.memory_task_store.recover_running()
             app.state.import_job_store.recover_stale_running(heartbeat_before=datetime.now(UTC))
@@ -2864,20 +2861,24 @@ def create_app(
             raise HTTPException(status_code=403, detail="source_not_authorized")
         return receipt
 
-    async def _require_sync_source(source_id: str) -> None:
-        """A host may only push files for a source this machine already granted.
+    async def _require_sync_source(source_id: str) -> Path:
+        """The root a host may append into, or a refusal.
 
         Sync is not an authorisation path: it extends a source root the user has
         already approved. Creating that approval from a host that only knows the
         source's name would let any paired host define what a source means.
+
+        The root returned is the grant's own, so what arrives here is read by the
+        importer without a second directory to keep in step.
         """
         _require_registration(app, source_id)
         grant_store = _grant_store(app)
-        receipt = await asyncio.to_thread(
-            grant_store.receipt, user_id="local", source_id=source_id
+        authorized = await asyncio.to_thread(
+            grant_store.authorized_root, user_id="local", source_id=source_id
         )
-        if receipt is None or receipt.revoked_at is not None:
+        if authorized is None:
             raise HTTPException(status_code=403, detail="source_not_authorized")
+        return authorized.root
 
     @app.get(
         "/api/v1/sources/{source_id}/files",
@@ -2891,9 +2892,9 @@ def create_app(
         side table: a table can disagree with the disk after a crash, and the
         only copy that matters is the one the importer will read.
         """
-        await _require_sync_source(source_id)
-        store = cast(ReceivedFileStore, app.state.received_file_store)
-        files = await asyncio.to_thread(store.manifest, source_id)
+        root = await _require_sync_source(source_id)
+        store = ReceivedFileStore()
+        files = await asyncio.to_thread(store.manifest, root)
         return SyncManifest(source_id=source_id, files=files)
 
     @app.post(
@@ -2908,8 +2909,8 @@ def create_app(
         interleave writes into the same file and both pass an offset check
         against the same size.
         """
-        await _require_sync_source(source_id)
-        store = cast(ReceivedFileStore, app.state.received_file_store)
+        root = await _require_sync_source(source_id)
+        store = ReceivedFileStore()
         try:
             payload = request.payload()
         except ValueError as error:
@@ -2919,7 +2920,7 @@ def create_app(
             try:
                 return await asyncio.to_thread(
                     store.append,
-                    source_id,
+                    root,
                     request.path,
                     offset=request.offset,
                     tail_hash=request.tail_hash,

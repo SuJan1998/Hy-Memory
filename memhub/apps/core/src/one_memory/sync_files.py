@@ -1,8 +1,13 @@
-"""The receiving end of cross-machine sync: what we hold for a source.
+"""The receiving end of cross-machine sync: appending to a source's own root.
 
 A host that keeps its memory here still has its transcripts on its own disk, and
 no server can reach that disk. This is the other half: the host asks what we
 already have for a source, and sends only the bytes past that point.
+
+Files are written **into the source's authorised root**, which is the directory
+the importer already scans. There is no separate receiving area: a second tree
+would have to be wired into the importer as well, and a tree that is written but
+never scanned is a sync that reports success and contributes nothing.
 
 Two properties decide the shape:
 
@@ -14,11 +19,6 @@ Two properties decide the shape:
   we are about to extend; if they do not match, the answer is `409` and the host
   re-reads the manifest on its next pass rather than writing into a file it no
   longer agrees with.
-
-Files live under `<data_dir>/received/<source_id>/<relative path>` and are only
-ever appended to. The importer reads that tree the same way it reads any other
-source root, so nothing downstream needs to know these files arrived over a
-socket instead of being on this disk.
 """
 
 import base64
@@ -109,16 +109,14 @@ def _tail_hash(handle: int, size: int) -> str:
 
 
 class ReceivedFileStore:
-    """Append-only storage for the files a host has sent us."""
+    """Append-only writes into a source's own authorised root.
 
-    def __init__(self, root: Path) -> None:
-        self.root = root
+    The root is passed in rather than held here: it is the grant's root, so the
+    importer and this store are looking at the same directory by construction
+    instead of by agreement.
+    """
 
-    def source_root(self, source_id: str) -> Path:
-        return self.root / source_id
-
-    def _resolve(self, source_id: str, relative: PurePosixPath) -> Path:
-        base = self.source_root(source_id)
+    def _resolve(self, base: Path, relative: PurePosixPath) -> Path:
         target = base.joinpath(*relative.parts)
         # Segments are already validated, so this cannot escape by name; it can
         # still escape through a symlink that is already on disk.
@@ -126,8 +124,7 @@ class ReceivedFileStore:
             raise ValueError("sync_path_invalid")
         return target
 
-    def manifest(self, source_id: str) -> tuple[ReceivedFile, ...]:
-        base = self.source_root(source_id)
+    def manifest(self, base: Path) -> tuple[ReceivedFile, ...]:
         if not base.is_dir():
             return ()
         files: list[ReceivedFile] = []
@@ -154,7 +151,7 @@ class ReceivedFileStore:
 
     def append(
         self,
-        source_id: str,
+        base: Path,
         path: str,
         *,
         offset: int,
@@ -169,8 +166,7 @@ class ReceivedFileStore:
         if len(tail_hash) != 64 or any(c not in "0123456789abcdef" for c in tail_hash):
             raise ValueError("sync_tail_hash_invalid")
 
-        base = self.source_root(source_id)
-        target = self._resolve(source_id, relative)
+        target = self._resolve(base, relative)
         base.mkdir(parents=True, exist_ok=True, mode=0o700)
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 

@@ -1,4 +1,4 @@
-"""The receiving end of cross-machine sync.
+"""Appending a host's files into a source's own authorised root.
 
 Two things are worth pinning here and they are different failures:
 
@@ -7,6 +7,10 @@ Two things are worth pinning here and they are different failures:
 * an append is validated against the bytes we hold, because a host may have
   rewritten its copy while we were unreachable and appending to a file the two
   sides disagree about produces a transcript that parses as nothing.
+
+The store takes the root from the caller rather than owning one. That is the
+whole point of the shape: what arrives is written where the importer already
+looks, so a sync cannot "succeed" into a directory nothing reads.
 """
 
 import base64
@@ -33,31 +37,45 @@ def tail(data: bytes, size: int = 4096) -> str:
 
 
 @pytest.fixture()
-def store(tmp_path):
-    return ReceivedFileStore(tmp_path / "received")
+def store():
+    return ReceivedFileStore()
 
 
-def append(store, path, data, *, offset=0, tail_hash=EMPTY_TAIL, source="codex"):
-    return store.append(source, path, offset=offset, tail_hash=tail_hash, data=data)
+@pytest.fixture()
+def root(tmp_path):
+    directory = tmp_path / "root"
+    directory.mkdir()
+    return directory
 
 
-def test_manifest_of_an_unknown_source_is_empty(store):
-    assert store.manifest("codex") == ()
+def append(store, root, path, data, *, offset=0, tail_hash=EMPTY_TAIL):
+    return store.append(root, path, offset=offset, tail_hash=tail_hash, data=data)
 
 
-def test_append_creates_the_file_and_reports_what_it_holds(store):
-    record = append(store, "sessions/a.jsonl", b'{"id":1}\n')
+def test_manifest_of_an_empty_root_is_empty(store, root):
+    assert store.manifest(root) == ()
+
+
+def test_manifest_of_a_root_that_does_not_exist_is_empty(store, tmp_path):
+    assert store.manifest(tmp_path / "missing") == ()
+
+
+def test_append_creates_the_file_and_reports_what_it_holds(store, root):
+    record = append(store, root, "sessions/a.jsonl", b'{"id":1}\n')
 
     assert record.path == "sessions/a.jsonl"
     assert record.size == 9
     assert record.tail_hash == tail(b'{"id":1}\n')
-    assert store.manifest("codex") == (record,)
+    assert store.manifest(root) == (record,)
+    # Written into the granted root itself, not a side tree.
+    assert (root / "sessions/a.jsonl").read_bytes() == b'{"id":1}\n'
 
 
-def test_append_continues_from_the_offset_the_manifest_reported(store):
-    first = append(store, "sessions/a.jsonl", b'{"id":1}\n')
+def test_append_continues_from_the_offset_the_manifest_reported(store, root):
+    first = append(store, root, "sessions/a.jsonl", b'{"id":1}\n')
     second = append(
         store,
+        root,
         "sessions/a.jsonl",
         b'{"id":2}\n',
         offset=first.size,
@@ -65,46 +83,44 @@ def test_append_continues_from_the_offset_the_manifest_reported(store):
     )
 
     assert second.size == 18
-    assert (store.source_root("codex") / "sessions/a.jsonl").read_bytes() == (
-        b'{"id":1}\n{"id":2}\n'
-    )
+    assert (root / "sessions/a.jsonl").read_bytes() == b'{"id":1}\n{"id":2}\n'
 
 
-def test_a_stale_offset_is_refused_rather_than_appended(store):
-    first = append(store, "sessions/a.jsonl", b'{"id":1}\n')
+def test_a_stale_offset_is_refused_rather_than_appended(store, root):
+    first = append(store, root, "sessions/a.jsonl", b'{"id":1}\n')
 
     with pytest.raises(SyncConflict) as raised:
-        append(store, "sessions/a.jsonl", b'{"id":2}\n', offset=0, tail_hash=EMPTY_TAIL)
+        append(store, root, "sessions/a.jsonl", b'{"id":2}\n', offset=0, tail_hash=EMPTY_TAIL)
     assert raised.value.code == "sync_offset_mismatch"
     # The file must be untouched: a refused append that wrote anyway would
     # corrupt the transcript for the next pass too.
-    assert (store.source_root("codex") / "sessions/a.jsonl").read_bytes() == b'{"id":1}\n'
+    assert (root / "sessions/a.jsonl").read_bytes() == b'{"id":1}\n'
     assert first.size == 9
 
 
-def test_a_tail_that_does_not_match_is_refused(store):
-    first = append(store, "sessions/a.jsonl", b'{"id":1}\n')
+def test_a_tail_that_does_not_match_is_refused(store, root):
+    first = append(store, root, "sessions/a.jsonl", b'{"id":1}\n')
     wrong = tail(b"something else entirely")
 
     with pytest.raises(SyncConflict) as raised:
-        append(store, "sessions/a.jsonl", b'{"id":2}\n', offset=first.size, tail_hash=wrong)
+        append(store, root, "sessions/a.jsonl", b'{"id":2}\n', offset=first.size, tail_hash=wrong)
     assert raised.value.code == "sync_tail_mismatch"
 
 
-def test_tail_hash_covers_only_the_last_window(store):
+def test_tail_hash_covers_only_the_last_window(store, root):
     long_record = b"x" * 9000
-    first = append(store, "sessions/big.jsonl", long_record)
+    first = append(store, root, "sessions/big.jsonl", long_record)
 
     assert first.tail_hash == hashlib.sha256(long_record[-4096:]).hexdigest()
     assert first.tail_hash != hashlib.sha256(long_record).hexdigest()
 
 
-def test_the_manifest_sees_every_file_and_no_directories(store):
-    append(store, "a/one.jsonl", b"1\n")
-    append(store, "a/two.jsonl", b"2\n")
-    append(store, "b/three.jsonl", b"3\n")
+def test_the_manifest_sees_every_file_and_no_directories(store, root):
+    append(store, root, "a/one.jsonl", b"1\n")
+    append(store, root, "a/two.jsonl", b"2\n")
+    append(store, root, "b/three.jsonl", b"3\n")
 
-    assert [item.path for item in store.manifest("codex")] == [
+    assert [item.path for item in store.manifest(root)] == [
         "a/one.jsonl",
         "a/two.jsonl",
         "b/three.jsonl",
@@ -129,48 +145,47 @@ def test_the_manifest_sees_every_file_and_no_directories(store):
         "a/.hidden.jsonl",
     ],
 )
-def test_a_path_that_could_leave_the_root_is_refused(store, path):
+def test_a_path_that_could_leave_the_root_is_refused(store, root, path):
     with pytest.raises(ValueError):
-        append(store, path, b"x")
+        append(store, root, path, b"x")
 
 
-def test_a_path_that_traverses_through_a_symlink_is_refused(store, tmp_path):
+def test_a_path_that_traverses_through_a_symlink_is_refused(store, root, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
-    base = store.source_root("codex")
-    base.mkdir(parents=True)
-    (base / "link").symlink_to(outside, target_is_directory=True)
+    (root / "link").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(ValueError):
-        append(store, "link/escape.jsonl", b"x")
+        append(store, root, "link/escape.jsonl", b"x")
     assert list(outside.iterdir()) == []
 
 
-def test_an_append_larger_than_the_cap_is_refused(store):
+def test_an_append_larger_than_the_cap_is_refused(store, root):
     with pytest.raises(ValueError):
-        append(store, "big.jsonl", b"x" * (MAX_APPEND_BYTES + 1))
+        append(store, root, "big.jsonl", b"x" * (MAX_APPEND_BYTES + 1))
 
 
-def test_a_malformed_tail_hash_is_refused(store):
+def test_a_malformed_tail_hash_is_refused(store, root):
     with pytest.raises(ValueError):
-        append(store, "a.jsonl", b"x", tail_hash="not-a-hash")
+        append(store, root, "a.jsonl", b"x", tail_hash="not-a-hash")
 
 
-def test_one_source_cannot_see_another(store):
-    append(store, "a.jsonl", b"codex\n", source="codex")
-    append(store, "a.jsonl", b"cursor\n", source="cursor")
+def test_two_roots_are_separate(store, tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    append(store, first, "a.jsonl", b"one\n")
+    append(store, second, "a.jsonl", b"two\n")
 
-    assert [item.path for item in store.manifest("codex")] == ["a.jsonl"]
-    assert (store.source_root("codex") / "a.jsonl").read_bytes() == b"codex\n"
-    assert (store.source_root("cursor") / "a.jsonl").read_bytes() == b"cursor\n"
+    assert [item.path for item in store.manifest(first)] == ["a.jsonl"]
+    assert (first / "a.jsonl").read_bytes() == b"one\n"
+    assert (second / "a.jsonl").read_bytes() == b"two\n"
 
 
-def test_a_directory_sitting_where_a_file_belongs_is_refused(store):
-    base = store.source_root("codex")
-    (base / "a.jsonl").mkdir(parents=True)
+def test_a_directory_sitting_where_a_file_belongs_is_refused(store, root):
+    (root / "a.jsonl").mkdir()
 
     with pytest.raises(ValueError):
-        append(store, "a.jsonl", b"x")
+        append(store, root, "a.jsonl", b"x")
 
 
 class _App:
@@ -250,6 +265,8 @@ def test_the_manifest_route_round_trips_through_an_append(tmp_path):
         assert manifest["files"] == [
             {"path": "sessions/a.jsonl", "size": 9, "tail_hash": body["tail_hash"]}
         ]
+        # The importer's root and the write target are the same directory.
+        assert (core.root / "sessions/a.jsonl").read_bytes() == b'{"id":1}\n'
 
 
 def test_a_conflicting_append_answers_409(tmp_path):
