@@ -307,6 +307,7 @@
 | `test_store_port.py` | `contract` | A1-04/A2: the store port, and that real implementations satisfy it. |
 | `test_subscription_visibility.py` | `unit` | A shared directory is not a read grant. |
 | `test_sync_facade.py` | `contract` | A2: the sync facade must keep the sync shape call sites already use. |
+| `test_sync_files.py` | `contract` | The receiving end of cross-machine sync. |
 | `test_tail_metadata_lane.py` | `contract` | Post-response metadata retries must be bounded and never block the route. |
 | `test_two_level_discovery.py` | `contract` | 3925a kernel item 1: two-level discovery. |
 | `test_ui_language.py` | `contract` | The App's display language, and the SDK prompt language it implies. |
@@ -323,4 +324,4 @@
 | `test_workspace_recall.py` | `contract` | Workspace memories were unreachable from every host; these pin the way in. |
 | `test_write_queue_lease_renewal.py` | `contract` | Rule 8: a lease must outlive the work it covers, and be renewed while it runs. |
 
-共 318 个测试文件。
+共 319 个测试文件。

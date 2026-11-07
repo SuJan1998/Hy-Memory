@@ -94,6 +94,13 @@ from one_memory.external_memory_access import (
 )
 from one_memory.extraction_settings import ExtractionSettings, ExtractionSettingsStore
 from one_memory.file_imports import FileImportStore, file_import_router
+from one_memory.sync_files import (
+    ReceivedFile,
+    ReceivedFileStore,
+    SyncAppendRequest,
+    SyncConflict,
+    SyncManifest,
+)
 from one_memory.hy_graph_admin import (
     GraphWidthDecision,
     GraphWidthMismatch,
@@ -1717,6 +1724,13 @@ def create_app(
             app.state.file_import_store = FileImportStore(
                 runtime_settings.data_dir / "import-files"
             )
+            # Files a host pushes to us over the network land here and are read
+            # back as an ordinary source root, so nothing downstream needs to
+            # know they did not start on this disk.
+            app.state.received_file_store = ReceivedFileStore(
+                runtime_settings.data_dir / "received"
+            )
+            app.state.sync_source_locks = {}
             app.state.memory_task_store.recover_running()
             app.state.import_job_store.recover_stale_running(heartbeat_before=datetime.now(UTC))
             app.state.import_supervisor = ImportSupervisor(
@@ -2849,6 +2863,72 @@ def create_app(
         if after is None or after.revoked_at is not None or after.granted_at != before.granted_at:
             raise HTTPException(status_code=403, detail="source_not_authorized")
         return receipt
+
+    async def _require_sync_source(source_id: str) -> None:
+        """A host may only push files for a source this machine already granted.
+
+        Sync is not an authorisation path: it extends a source root the user has
+        already approved. Creating that approval from a host that only knows the
+        source's name would let any paired host define what a source means.
+        """
+        _require_registration(app, source_id)
+        grant_store = _grant_store(app)
+        receipt = await asyncio.to_thread(
+            grant_store.receipt, user_id="local", source_id=source_id
+        )
+        if receipt is None or receipt.revoked_at is not None:
+            raise HTTPException(status_code=403, detail="source_not_authorized")
+
+    @app.get(
+        "/api/v1/sources/{source_id}/files",
+        response_model=SyncManifest,
+        dependencies=protected,
+    )
+    async def source_files(source_id: str) -> SyncManifest:
+        """What we hold for this source, which is also the host's resume state.
+
+        The manifest is computed from the files themselves rather than kept in a
+        side table: a table can disagree with the disk after a crash, and the
+        only copy that matters is the one the importer will read.
+        """
+        await _require_sync_source(source_id)
+        store = cast(ReceivedFileStore, app.state.received_file_store)
+        files = await asyncio.to_thread(store.manifest, source_id)
+        return SyncManifest(source_id=source_id, files=files)
+
+    @app.post(
+        "/api/v1/sources/{source_id}/files",
+        response_model=ReceivedFile,
+        dependencies=protected,
+    )
+    async def append_source_file(source_id: str, request: SyncAppendRequest) -> ReceivedFile:
+        """Extend one file by the bytes the host says come next.
+
+        Serialised per source: two hosts, or two passes of one host, must not
+        interleave writes into the same file and both pass an offset check
+        against the same size.
+        """
+        await _require_sync_source(source_id)
+        store = cast(ReceivedFileStore, app.state.received_file_store)
+        try:
+            payload = request.payload()
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        lock = app.state.sync_source_locks.setdefault(source_id, asyncio.Lock())
+        async with lock:
+            try:
+                return await asyncio.to_thread(
+                    store.append,
+                    source_id,
+                    request.path,
+                    offset=request.offset,
+                    tail_hash=request.tail_hash,
+                    data=payload,
+                )
+            except SyncConflict as error:
+                raise HTTPException(status_code=409, detail=error.code) from None
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from None
 
     @app.post(
         "/api/v1/sources/{source_id}/authorize",
